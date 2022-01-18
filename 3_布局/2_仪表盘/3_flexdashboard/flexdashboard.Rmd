@@ -1,0 +1,361 @@
+---
+title: "flexdashboard布局"
+runtime: shiny
+output: 
+  flexdashboard::flex_dashboard:
+    orientation: row
+    vertical_layout: fill
+---
+
+<script>
+$("body").on("shown.bs.tab", "a[data-toggle='tab']", function(e) {
+   Shiny.setInputValue("active_tab", $(e.target).parent().index());
+})
+</script>
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(shiny)
+library(flexdashboard)
+library(rlang)
+
+is_empty <- function (x, empty = "\\s*")
+{
+  length(x) == 0 || (length(x) == 1 && is.na(x)) ||
+    (length(x) == 1 && grepl(paste0("^", empty, "$"), x))
+}
+
+# 从文件中读取数据
+read_data <- function(datafile_name, datafile_path) {
+  ext <- tools::file_ext(datafile_name)
+  switch(ext,
+         csv = vroom::vroom(datafile_path, delim = ","),
+         tsv = vroom::vroom(datafile_path, delim = "\t"),
+         xls = readxl::read_xls(datafile_path),
+         xlsx = readxl::read_xlsx(datafile_path),
+         sav = tibble::as_tibble(foreign::read.spss(datafile_path)),
+         json = jsonlite::read_json(datafile_path, simplifyVector = TRUE),
+         validate("Invalid file; 请上传 .csv、.tsv、xls、xlsx, sav 格式的文件")
+  )
+}
+
+pdf(NULL)
+```
+
+```{r load_prep_data}
+m_datasets <- readRDS(file="../../../data/m_datasets.rds")
+
+# 数据变换的类型
+m_transforms <- c("对数变换", "标准化")
+
+# 内置数据集名称
+built_in_dataset_names <- names(m_datasets)
+```
+
+Sidebar {.sidebar}
+=====================================
+
+#### **选择数据集**
+
+```{r}
+selectInput("dataset", NULL, names(m_datasets), selected="SurgicalUnit")
+
+uiOutput("operation")
+```
+
+```{r}
+#https://stackoverflow.com/questions/64306794/
+output$operation <- renderUI({
+  sel <- input$active_tab
+  if (is.null(sel) || sel == 0) {
+    list(
+
+      checkboxInput("show_select", "选择变量", value=FALSE),
+      conditionalPanel("input.show_select == true",
+                       wellPanel(
+                         selectInput("columns", NULL, multiple=TRUE,
+                                     choices=names(m_datasets[["SurgicalUnit"]]),
+                                     selected=names(m_datasets[["SurgicalUnit"]]),
+                                     selectize=F)
+                       )),
+
+      # 数据筛选
+      checkboxInput("show_filter", "筛选数据", value=FALSE),
+      conditionalPanel("input.show_filter == true",
+                       wellPanel(
+                         textAreaInput("data_filter", NULL,
+                                       placeholder="输入筛选条件（例如，Age>50）并按返回键",
+                                       resize="vertical", rows=3),
+                         actionButton(inputId="data_filter_ok", label="完成"),
+                         actionButton(inputId="data_filter_clear", label="清除")
+                       )),
+      
+      checkboxInput("show_transform", "数据变换", value=FALSE),
+      conditionalPanel("input.show_transform == true",
+                       wellPanel(
+                         selectInput("transform", "选择变换类型：", multiple=FALSE,
+                                     choices=m_transforms),
+                         conditionalPanel("input.transform == '对数变换'",
+                                          uiOutput("log_transform_ui")),
+                         conditionalPanel("input.transform == '标准化'",
+                                          uiOutput("standardize_ui")),
+                       )),
+      
+      checkboxInput("show_store", "保存数据", value=FALSE),
+      conditionalPanel("input.show_store == true",
+                       wellPanel(
+                         textInput("dataset_name", "输入数据集名称:", "NewData"),
+                         actionButton("add_dataset", "保存", class = "btn-success")
+                       )),
+      
+      checkboxInput("show_delete", "删除数据", value=FALSE),
+      conditionalPanel("input.show_delete == true",
+                       wellPanel(
+                         selectInput("del_dataset_names", "选择删除的变量：", multiple=TRUE,
+                                     choices=NULL, selected=NULL),
+                         actionButton("del_dataset", "删除", class = "btn-danger")
+                       )),
+      
+      checkboxInput("show_upload", "上传数据", value=FALSE),
+      conditionalPanel("input.show_upload == true",
+                       wellPanel(
+                         textInput("upload_dataset_name", "输入上传数据集名称:", "UserData"),
+                         helpText('上传文件(.csv、.tsv、xls、xlsx, sav)：'),
+                         fileInput("upload", NULL, accept = c(".csv", ".tsv"),
+                                   buttonLabel = list(icon = icon("upload"), "上传..."),
+                                   multiple=FALSE, placeholder = "未选择任何文件"),
+                         actionButton("import_dataset", "导入", class = "btn-success"),
+                       )),
+      
+      checkboxInput("show_download", "下载数据", value=FALSE),
+      conditionalPanel("input.show_download == true",
+                       downloadButton("download_dataset", "下载数据集",
+                                      style = "color: #fff; background-color: #00c0ef; border-color: #00c0ef;")
+      ))
+  } else {
+    df <- m_datasets[[input$dataset]]
+    vars <- names(df)[purrr::map_lgl(df, ~is.numeric(.) | is.factor(.))]
+    selectInput("vis1_var", "选择变量：", multiple=FALSE,
+                choices=vars)
+  }
+})
+```
+
+
+```{r}
+dataset <- reactive(m_datasets[[input$dataset]])
+
+vars <- reactive(names(dataset())[purrr::map_lgl(dataset(), ~is.numeric(.) | is.factor(.))])
+
+# 数据集发生切换后，更新变量（列）的选择项
+# observeEvent()直接监控输入
+observeEvent(input$dataset, {
+  
+  # “冻结”输入：确保任何使用该输入的反应值或输出都不会被更新。
+  freezeReactiveValue(input, "columns")
+  freezeReactiveValue(input, "vis1_var")
+  
+  df <- m_datasets[[input$dataset]]
+  vars <- names(df)[purrr::map_lgl(df, ~is.numeric(.) | is.factor(.))]
+  
+  # 以新数据集的变量名更新变量（列）的选择项
+  updateSelectInput(inputId = "columns", choices = names(df), selected = names(df))
+  updateSelectInput(inputId = "vis1_var", choices = vars)
+})
+
+# 变量选择后的数据
+selected_data <- reactive({
+  if (input$show_select) dataset()[, input$columns] else dataset()
+})
+
+# 合并数据 = 变量选择后的数据 + 变换数据
+merge_data <- reactive({
+  df <- selected_data()
+  if (input$show_transform & !is.null(transformed_data())) {
+    df <- cbind(df, transformed_data()) }
+  return (df)
+})
+
+# 字符串筛选条件
+filter_str <- reactiveValues(data=NULL)
+
+# 保存筛选条件
+observeEvent(input$data_filter_ok, {
+  filter_str$data <- input$data_filter
+})
+
+# 清除筛选条件
+observeEvent(input$data_filter_clear, {
+  updateTextAreaInput(inputId = "data_filter", value = "")
+  filter_str$data <- NULL
+})
+
+# 对合并数据进行筛选得到的数据
+filter_data <- reactive({
+  
+  tryCatch({
+    df <- merge_data()
+    if (!is_empty(filter_str$data)) {
+      df <- filter(df, eval_tidy(parse_expr(filter_str$data)))
+    }
+    shinyFeedback::feedbackWarning("data_filter", F, "")
+    return (df)
+  }, error = function(e) {
+    shinyFeedback::feedbackWarning("data_filter", T, e$message)
+    return (merge_data())
+  })
+})
+
+# 对数变换UI
+output$log_transform_ui <- renderUI({
+  df <- dataset() %>% dplyr::select_if(is.numeric)
+  vars <- names(df)[purrr::map_lgl(df, ~min(.)>0)]
+  selectInput("log_transform_vars", "选择作变换的变量：",
+              multiple=TRUE, choices=vars, selected=NULL)
+})
+
+# 对数变换数据
+transformed_data <- reactive({
+  df <- NULL
+  if (input$transform=="对数变换" & !is_empty(input$log_transform_vars)) {
+    df <- dataset()[,input$log_transform_vars] %>% map(log)
+    names(df) <- paste0("LOG ", names(df))
+  } else if (input$transform=="标准化" & !is_empty(input$standardize_vars)) {
+    df <- dataset()[,input$standardize_vars] %>% map(scale)
+    names(df) <- paste0("STD ", names(df))
+  }
+  return (df)
+})
+
+# 标准化UI
+output$standardize_ui <- renderUI({
+  vars <- dataset() %>% dplyr::select_if(is.numeric) %>% names()
+  selectInput("standardize_vars", "选择作变换的变量：",
+              multiple=TRUE, choices=vars, selected=NULL)
+})
+
+# 处理后的最终数据
+processed_data <- reactive({
+  if(input$show_filter) filter_data() else merge_data()
+})
+
+observeEvent(input$add_dataset, {
+  
+  is_empty_name <- is_empty(input$dataset_name)
+  shinyFeedback::feedbackWarning("dataset_name", is_empty_name, "数据名不能为空！")
+  req(!is_empty(input$dataset_name))
+  
+  is_built_in <- (input$dataset_name %in% built_in_dataset_names)
+  shinyFeedback::feedbackWarning("dataset_name", is_built_in, "不能与内置数据集同名！")
+  req(!is_built_in)
+  
+  m_datasets[[input$dataset_name]] <<- processed_data()
+  
+  freezeReactiveValue(input, "dataset")
+  updateSelectInput(inputId = "dataset", choices = names(m_datasets), selected = input$dataset_name)
+  updateSelectInput(inputId = "del_dataset_names", choices = setdiff(names(m_datasets), built_in_dataset_names), selected = NULL)
+})
+
+observeEvent(input$del_dataset, {
+  
+  req(!is_empty(input$del_dataset_names))
+  
+  freezeReactiveValue(input, "dataset")
+  for (dat_name in input$del_dataset_names) {
+    m_datasets[[dat_name]] <<- NULL
+  }
+  
+  updateSelectInput(inputId = "dataset", choices = names(m_datasets), selected = "SurgicalUnit")
+  updateSelectInput(inputId = "del_dataset_names", choices = setdiff(names(m_datasets), built_in_dataset_names), selected = NULL)
+})
+
+observeEvent(input$import_dataset, {
+  req(input$upload)
+  
+  is_empty_name <- is_empty(input$upload_dataset_name)
+  shinyFeedback::feedbackWarning("upload_dataset_name", is_empty_name, "数据名不能为空！")
+  req(!is_empty(input$upload_dataset_name))
+  
+  is_built_in <- (input$upload_dataset_name %in% built_in_dataset_names)
+  shinyFeedback::feedbackWarning("upload_dataset_name", is_built_in, "不能与内置数据集同名！")
+  req(!is_built_in)
+  
+  df <- read_data(input$upload$name, input$upload$datapath)
+  
+  m_datasets[[input$upload_dataset_name]] <<- df
+  freezeReactiveValue(input, "dataset")
+  updateSelectInput(inputId = "dataset", choices = names(m_datasets), selected = input$upload_dataset_name)
+  updateSelectInput(inputId = "del_dataset_names", choices = setdiff(names(m_datasets), built_in_dataset_names), selected = NULL)
+  
+})
+
+output$download_dataset <- downloadHandler(
+  filename = function() {
+    paste0(input$dataset, ".csv")
+  },
+  content = function(file) {
+    vroom::vroom_write(processed_data(), file)
+  }
+)
+```
+
+数据
+=====================================
+
+Row 
+-------------------------------------
+
+###
+
+```{r}
+# 变量选择后的数据
+selected_data <- reactive({
+  if (input$show_select) dataset()[, input$columns] else dataset()
+})
+
+DT::renderDataTable({
+  processed_data()
+}, options = list(
+  # 表格中显示的中文标签
+  language = list(
+    info = "显示第 _START_ 至 _END_ 项结果，共 _TOTAL_ 项",
+    search = "搜索：",
+    paginate = list(previous = "上一页", `next` = "下一页"),
+    lengthMenu = "显示 _MENU_ 项结果"
+  ),
+  pageLength = 5,
+  scrollX = TRUE # 水平方向滑动条
+))
+```
+
+单变量可视化
+=====================================
+
+Row 
+-------------------------------------
+
+###
+
+```{r}
+renderPlot({
+  req(input$vis1_var)
+  x = dataset()[[input$vis1_var]]
+  if (is.numeric(x)) {
+    hist(x)
+  } else {
+    plot(x)
+  }
+  
+})
+```
+
+
+```{r}
+ui <- fluidPage(
+)
+
+server <- function(input, output, session) {
+}
+
+shinyApp(ui, server)
+```
